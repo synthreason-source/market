@@ -135,7 +135,7 @@ class SubsetMovementPredictor:
 # ==========================================
 
 if __name__ == "__main__":
-    TOP_N_COINS = 25
+    TOP_N_COINS = 50
     
     print(f"\n[System] Fetching top {TOP_N_COINS} market pairs by trading volume...")
     symbols = fetch_top_volume_pairs(limit=TOP_N_COINS)
