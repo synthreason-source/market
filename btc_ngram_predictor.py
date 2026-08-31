@@ -22,7 +22,7 @@ import pystray
 # no genuine predictive edge on BTC price.
 # ============================================================
 
-REFRESH_INTERVAL_SECONDS = 5 * 60   # how often to poll price + re-predict
+REFRESH_INTERVAL_SECONDS = 1 * 60   # how often to poll price + re-predict
 HISTORY_DAYS = 90                    # initial training window
 
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
