@@ -24,6 +24,7 @@ import pystray
 
 REFRESH_INTERVAL_SECONDS = 1 * 60   # how often to poll price + re-predict
 HISTORY_DAYS = 90                    # initial training window
+RETRAIN_EVERY_N_CYCLES = 30          # retrain the model every N refreshes
 
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
@@ -278,7 +279,11 @@ stop_event = threading.Event()
 wake_event = threading.Event()  # set to trigger an immediate refresh
 
 
-def run_cycle(price_history: List[float], model_holder: dict) -> None:
+def run_cycle(
+    price_history: List[float],
+    model_holder: dict,
+    cycle_count: int,
+) -> None:
     current_price = fetch_latest_price()
     with state.lock:
         if current_price is None:
@@ -297,10 +302,18 @@ def run_cycle(price_history: List[float], model_holder: dict) -> None:
         price_history.append(current_price)
         tokens = prices_to_tokens(price_history)
 
-        model = NGramModel()
-        model.ingest_tokens(tokens)
-        model.finalize()
-        model_holder["model"] = model
+        # Retrain only every RETRAIN_EVERY_N_CYCLES
+        if cycle_count % RETRAIN_EVERY_N_CYCLES == 0 or model_holder.get("model") is None:
+            model = NGramModel()
+            model.ingest_tokens(tokens)
+            model.finalize()
+            model_holder["model"] = model
+        else:
+            # Optionally, you could update some online stats here if desired.
+            # For now, we just reuse the existing model.
+            pass
+
+        model = model_holder["model"]
 
         prev = tokens[-1] if tokens else "<bos>"
         prev_prev = tokens[-2] if len(tokens) >= 2 else None
@@ -318,10 +331,12 @@ def background_loop() -> None:
     with state.lock:
         state.status = "fetching history..."
     price_history = fetch_btc_history()
+    model_holder: dict = {}
+    cycle_count = 0
 
     while not stop_event.is_set():
-        model_holder: dict = {}
-        run_cycle(price_history, model_holder)
+        cycle_count += 1
+        run_cycle(price_history, model_holder, cycle_count)
         wake_event.wait(REFRESH_INTERVAL_SECONDS)
         wake_event.clear()
 
