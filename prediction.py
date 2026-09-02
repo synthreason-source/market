@@ -2,7 +2,8 @@
 aapl_prediction_single_file.py
 
 Everything in one file, no local module imports:
-  1. Download real AAPL daily closes.
+  1. Download real daily closes for any ticker symbol (Yahoo Finance's
+     public chart endpoint), with a bundled real-data fallback for AAPL.
   2. Symbolize returns into a small alphabet and pack them into
      combinatorial block tokens (so each "word" the model sees covers
      several real trading days).
@@ -11,33 +12,47 @@ Everything in one file, no local module imports:
      directly on that block-token stream.
   4. Sample a continuation from the trained model.
   5. Decode the generated block tokens back into a synthetic price path.
-  6. Export history.csv / prediction.csv / actual_future.csv for
-     plot_prediction.m.
+  6. Export history.csv / prediction.csv / actual_future.csv, write
+     plot_prediction.m, and run it (MATLAB/Octave) to produce the PNG.
 
-Only standard library is used (csv, math, random, re, urllib, dataclasses,
-collections, pathlib, typing) -- no project-local imports.
+Usage:
+    python3 aapl_prediction_single_file.py                # AAPL, default
+    python3 aapl_prediction_single_file.py TSLA
+    python3 aapl_prediction_single_file.py --symbol MSFT --days 400
+
+Only standard library is used (csv, json, math, random, re, urllib,
+dataclasses, collections, pathlib, typing) -- no project-local imports.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import json
 import math
 import random
 import re
 import shutil
 import subprocess
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 # ============================================================
 # Config
 # ============================================================
 
-AAPL_CSV_URL = "https://raw.githubusercontent.com/plotly/datasets/master/finance-charts-apple.csv"
-AAPL_CSV_LOCAL = "aapl_real.csv"
+DEFAULT_SYMBOL = "MSFT"
+DEFAULT_DAYS = 500  # trading days of history to request
+
+# Bundled real fallback dataset, only used if Yahoo can't be reached and
+# the requested symbol is AAPL -- so the script still works offline for
+# the one symbol it ships a cached copy for.
+AAPL_FALLBACK_CSV_URL = "https://raw.githubusercontent.com/plotly/datasets/master/finance-charts-apple.csv"
 
 N_HOLDOUT = 15                       # bars held out to compare prediction vs reality
 ALPHABET = ("D", ".", "U")           # down / flat / up
@@ -52,22 +67,78 @@ INFLUENCE_TAU = 0.6
 RANDOM_SEED = 2026
 random.seed(RANDOM_SEED)
 
+# Yahoo will 403 a bare urllib request with no User-Agent.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/csv, */*",
+}
+
 
 # ============================================================
-# 1. Real data download
+# 1. Real data download, by symbol
 # ============================================================
 
-def download_real_prices(url: str = AAPL_CSV_URL, path: str = AAPL_CSV_LOCAL) -> List[float]:
-    """Download real AAPL daily closes (cached locally after first run)."""
+def _http_get(url: str, timeout: int = 10) -> str:
+    req = urllib.request.Request(url, headers=HTTP_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def fetch_yahoo_closes(symbol: str, days: int = DEFAULT_DAYS) -> List[float]:
+    """Real daily closes for any Yahoo Finance ticker: stocks (AAPL),
+    indices (^GSPC), forex pairs (EURUSD=X), etc. Requests ~2x the
+    trading-day window in calendar days to comfortably cover weekends
+    and holidays, then trims to the last `days` closes.
+    """
+    encoded = quote(symbol, safe="")  # "^" and "=" need encoding
+    range_str = "5y" if days > 500 else "2y" if days > 200 else "1y"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range={range_str}&interval=1d"
+    data = json.loads(_http_get(url))
+    result = data["chart"]["result"][0]
+    closes = [c for c in result["indicators"]["quote"][0]["close"] if c is not None]
+    if len(closes) < 10:
+        raise ValueError(f"too few points returned for {symbol!r}")
+    return closes[-days:]
+
+
+def fetch_aapl_fallback_closes(path: str = "aapl_fallback.csv") -> List[float]:
+    """Bundled known-good real AAPL dataset (2015-2017), used only if
+    Yahoo can't be reached and the requested symbol is AAPL.
+    """
     if not Path(path).exists():
-        urllib.request.urlretrieve(url, path)
-
+        urllib.request.urlretrieve(AAPL_FALLBACK_CSV_URL, path)
     closes = []
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             closes.append(float(row["AAPL.Close"]))
     return closes
+
+
+def download_prices_for_symbol(symbol: str, days: int = DEFAULT_DAYS) -> List[float]:
+    """Real daily closes for the given ticker symbol. Tries Yahoo Finance
+    first (works for any symbol); if that fails and the symbol is AAPL,
+    falls back to a bundled real dataset so the script still runs offline.
+    """
+    try:
+        closes = fetch_yahoo_closes(symbol, days)
+        print(f"Downloaded {len(closes)} real closes for {symbol} from Yahoo Finance")
+        return closes
+    except Exception as exc:
+        print(f"Yahoo Finance fetch failed for {symbol!r} ({type(exc).__name__}: {exc})")
+        if symbol.upper() == "AAPL":
+            print("Falling back to bundled real AAPL dataset (2015-2017)...")
+            closes = fetch_aapl_fallback_closes()
+            print(f"Loaded {len(closes)} real AAPL closes from fallback dataset")
+            return closes
+        raise RuntimeError(
+            f"Could not download real data for symbol {symbol!r}, and no offline "
+            f"fallback exists for symbols other than AAPL. Check the symbol and "
+            f"your network connection."
+        ) from exc
 
 
 # ============================================================
@@ -315,7 +386,7 @@ text(handoff_idx, handoff_price, '  now', 'FontSize', 9, 'VerticalAlignment', 'b
 
 xlabel('Bar index');
 ylabel('Price');
-title('AAPL: historical price with n-gram model predicted continuation');
+title('__SYMBOL__: historical price with n-gram model predicted continuation');
 legend('Location', 'best');
 ylim([y_min y_max]);
 grid on;
@@ -329,13 +400,15 @@ fprintf('Saved prediction_chart.png\n');
 """
 
 
-def render_chart_with_matlab_or_octave(m_script_path: str = "plot_prediction.m") -> bool:
-    """Write out the .m script, then actually try to run it so the PNG
-    gets produced as part of this one script -- rather than leaving that
-    as a separate manual step. Tries MATLAB first, falls back to Octave.
-    Returns True if prediction_chart.png was successfully created.
+def render_chart_with_matlab_or_octave(symbol: str, m_script_path: str = "plot_prediction.m") -> bool:
+    """Write out the .m script (with the symbol baked into the title),
+    then actually try to run it so the PNG gets produced as part of this
+    one script -- rather than leaving that as a separate manual step.
+    Tries MATLAB first, falls back to Octave. Returns True if
+    prediction_chart.png was successfully created.
     """
-    Path(m_script_path).write_text(PLOT_PREDICTION_M)
+    script_text = PLOT_PREDICTION_M.replace("__SYMBOL__", symbol.upper())
+    Path(m_script_path).write_text(script_text)
 
     candidates = [
         ["matlab", "-batch", "run('plot_prediction.m')"],
@@ -531,8 +604,18 @@ def generate_tokens(model: NGramModel, n_steps: int, temperature: float = TEMPER
 # ============================================================
 
 def main() -> None:
-    prices = download_real_prices()
-    print(f"Loaded {len(prices)} real AAPL daily closes "
+    parser = argparse.ArgumentParser(description="Download real prices for a symbol, train the n-gram "
+                                                   "block-token model, and render a MATLAB/Octave chart.")
+    parser.add_argument("symbol", nargs="?", default=DEFAULT_SYMBOL,
+                         help=f"Ticker symbol to download (default: {DEFAULT_SYMBOL}). "
+                              f"Any Yahoo Finance symbol works: AAPL, TSLA, ^GSPC, EURUSD=X, BTC-USD, etc.")
+    parser.add_argument("--symbol", dest="symbol_flag", default=None, help="Alternative to the positional symbol arg.")
+    parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help=f"Trading days of history (default: {DEFAULT_DAYS}).")
+    args = parser.parse_args()
+    symbol = (args.symbol_flag or args.symbol).upper()
+
+    prices = download_prices_for_symbol(symbol, days=args.days)
+    print(f"Loaded {len(prices)} real {symbol} daily closes "
           f"(range ${min(prices):.2f}-${max(prices):.2f})")
 
     train_prices = prices[:-N_HOLDOUT]
@@ -567,7 +650,7 @@ def main() -> None:
             w.writerow([start_idx + i, p])
     print("Wrote actual_future.csv")
 
-    render_chart_with_matlab_or_octave()
+    render_chart_with_matlab_or_octave(symbol)
 
 
 if __name__ == "__main__":
