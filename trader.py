@@ -39,7 +39,7 @@ KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY", "I")
 KRAKEN_PRIVATE_KEY = os.environ.get("KRAKEN_PRIVATE_KEY", "")
 
 # Live order sizing parameters
-TARGET_DOGE_VOLUME = 0.1
+TARGET_DOGE_VOLUME = 30
 # Kraken enforces minimum order sizes (e.g., ~30-50 DOGE). 
 # Set this to True to enforce the requested 0.1 DOGE strictly, 
 # or False to scale up automatically to Kraken's minimum if rejected.
