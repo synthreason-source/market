@@ -8,33 +8,428 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import quote
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw
 import pystray
 
 # ============================================================
-# DISCLAIMER
+# LIVE TRADING SAFETY WARNING
 # ============================================================
-# Toy statistical exercise, not a trading system. No genuine
-# predictive edge on BTC, stocks, or index prices. The "model"
-# is an n-gram toy over discretized percent-change tokens.
+# This script executes real orders using financial capital via API keys.
+# Ensure your API keys have correct IP restrictions and sizing controls.
 # ============================================================
 
-REFRESH_INTERVAL_SECONDS = 30       # how often to poll price + re-predict
-HISTORY_DAYS = 90                   # initial training window
-RETRAIN_EXT_N_CYCLES = 45           # retrain the model every N refreshes
+REFRESH_INTERVAL_SECONDS = 30       
+HISTORY_DAYS = 90                   
+RETRAIN_EVERY_N_CYCLES = 45         
 
 FORECAST_HORIZON_SECONDS = 24 * 60 * 60
 FORECAST_STEPS = max(1, FORECAST_HORIZON_SECONDS // REFRESH_INTERVAL_SECONDS)
 
-IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
-
 COINAPI_KEY = os.environ.get("COINAPI_KEY", "YOUR_COINAPI_KEY_HERE")
+EMS_BASE_URL = "https://ems.coinapi.io/v1"
+
+# Live trading configuration
+LIVE_TRADING_ENABLED = False        # Flip to True to unlock live execution
+ORDER_AMOUNT_USD = 10.0             # Real order size in quote currency
+
+MOVE_THRESHOLDS = [
+    ("strong_down", -1.5),
+    ("down", -0.3),
+    ("flat", 0.3),
+    ("up", 1.5),
+    ("strong_up", math.inf),
+]
+MOVE_MIDPOINTS = {
+    "strong_down": -2.5, "down": -0.8, "flat": 0.0, "up": 0.8, "strong_up": 2.5,
+}
+MOVE_COLOR_BUCKET = {
+    "strong_down": "down", "down": "down",
+    "flat": "flat",
+    "up": "up", "strong_up": "up",
+}
+COLORS = {
+    "up": (46, 160, 67),      
+    "down": (219, 68, 55),    
+    "flat": (128, 128, 128),  
+    "unknown": (100, 100, 100),
+}
+
+random.seed()
+
+@dataclass(frozen=True)
+class AssetSpec:
+    key: str                
+    label: str              
+    kind: str               
+    coinapi_symbol: str     
+    exchange_id: str        # Target exchange ID for EMS routing (e.g., "BITSTAMP", "COINBASE")
+    base_asset: str         # e.g., "BTC"
+    quote_asset: str        # e.g., "USD"
+
+
+ASSETS: List[AssetSpec] = [
+    AssetSpec("btc", "BTC/USD", "crypto", "BITSTAMP_SPOT_BTC_USD", "BITSTAMP", "BTC", "USD"),
+    AssetSpec("eth", "ETH/USD", "crypto", "BITSTAMP_SPOT_ETH_USD", "BITSTAMP", "ETH", "USD"),
+    AssetSpec("sol", "SOL/USD", "crypto", "COINBASE_SPOT_SOL_USD", "COINBASE", "SOL", "USD"),
+]
+ASSETS_BY_KEY = {a.key: a for a in ASSETS}
+
+# ============================================================
+# CoinAPI EMS Live Execution Engine
+# ============================================================
+
+@dataclass
+class LiveTrader:
+    active_orders: Dict[str, dict] = field(default_factory=dict)
+    execution_history: List[dict] = field(default_factory=list)
+
+    def evaluate_signal(self, spec: AssetSpec, current_price: float, predicted_token: str) -> None:
+        if not LIVE_TRADING_ENABLED:
+            return
+        
+        current_pos = self.active_orders.get(spec.key)
+
+        # Flip logic: Close existing position if signal reverses or flattens
+        if current_pos is not None:
+            should_exit = False
+            if current_pos["side"] == "BUY" and predicted_token in ("down", "strong_down"):
+                should_exit = True
+            elif current_pos["side"] == "SELL" and predicted_token in ("up", "strong_up"):
+                should_exit = True
+            elif predicted_token == "flat":
+                should_exit = True
+
+            if should_exit:
+                self._submit_order(spec, "SELL" if current_pos["side"] == "BUY" else "BUY", current_pos["amount"])
+                self.active_orders.pop(spec.key, None)
+
+        # Open entry logic
+        if spec.key not in self.active_orders:
+            if predicted_token in ("up", "strong_up"):
+                qty = ORDER_AMOUNT_USD / current_price
+                self._submit_order(spec, "BUY", qty)
+                self.active_orders[spec.key] = {"side": "BUY", "amount": qty, "entry": current_price}
+            elif predicted_token in ("down", "strong_down"):
+                qty = ORDER_AMOUNT_USD / current_price
+                self._submit_order(spec, "SELL", qty)
+                self.active_orders[spec.key] = {"side": "SELL", "amount": qty, "entry": current_price}
+
+    def _submit_order(self, spec: AssetSpec, side: str, quantity: float) -> Optional[dict]:
+        url = f"{EMS_BASE_URL}/orders"
+        payload = {
+            "exchange_id": spec.exchange_id,
+            "client_order_id": f"ngram-{int(time.time() * 1000)}",
+            "symbol_id": spec.coinapi_symbol,
+            "amount": round(quantity, 6),
+            "price": 0.0,  # Market order execution
+            "side": side,
+            "order_type": "MARKET",
+            "time_in_force": "IOC"
+        }
+        headers = {
+            "X-CoinAPI-Key": COINAPI_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        try:
+            req = urllib.request.Request(
+                url, 
+                data=json.dumps(payload).encode("utf-8"), 
+                headers=headers, 
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                self.execution_history.append(data)
+                return data
+        except Exception as e:
+            self.execution_history.append({"error": str(e), "spec": spec.key})
+            return None
+
+
+live_portfolio = LiveTrader()
+
+# ============================================================
+# Market Data REST Fetching
+# ============================================================
+
+def _http_get(url: str, timeout: int = 10) -> str:
+    headers = {
+        "X-CoinAPI-Key": COINAPI_KEY,
+        "Accept": "application/json",
+        "User-Agent": "CoinAPILiveTrader/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
+def fetch_coinapi_history(symbol_id: str, days: int = HISTORY_DAYS) -> List[float]:
+    try:
+        end_time = time.strftime("%Y-%m-%dT%H:%M:%S")
+        start_time = time.strftime(
+            "%Y-%m-%dT%H:%M:%S", 
+            time.gmtime(time.time() - (days * 24 * 60 * 60))
+        )
+        url = (
+            f"https://rest.coinapi.io/v1/ohlcv/{symbol_id}/history"
+            f"?period_id=1DAY&time_start={start_time}&time_end={end_time}"
+        )
+        data = json.loads(_http_get(url))
+        if not isinstance(data, list) or len(data) < 5:
+            raise ValueError("Invalid history")
+        prices = [float(item["price_close"]) for item in data if "price_close" in item]
+        return prices if len(prices) >= 5 else _synthetic_prices(days)
+    except Exception:
+        return _synthetic_prices(days)
+
+
+def fetch_coinapi_price(symbol_id: str) -> Tuple[Optional[float], Optional[str]]:
+    url = f"https://rest.coinapi.io/v1/trades/{symbol_id}/latest?limit=1"
+    try:
+        data = json.loads(_http_get(url))
+        if isinstance(data, list) and len(data) > 0:
+            return float(data[0]["price"]), None
+        elif isinstance(data, dict) and "price" in data:
+            return float(data["price"]), None
+        return None, f"No price payload for {symbol_id}"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _synthetic_prices(days: int) -> List[float]:
+    price = 100.0
+    out = []
+    for _ in range(days):
+        pct = random.gauss(0, 1.5) / 100.0
+        price = max(price * (1 + pct), 1.0)
+        out.append(price)
+    return out
+
+
+# ============================================================
+# Tokenization & N-Gram Core
+# ============================================================
+
+def pct_change(prev: float, curr: float) -> float:
+    return 0.0 if prev == 0 else (curr - prev) / prev * 100.0
+
+
+def movement_token(change_pct: float) -> str:
+    for label, upper in MOVE_THRESHOLDS:
+        if change_pct < upper:
+            return label
+    return MOVE_THRESHOLDS[-1][0]
+
+
+def prices_to_tokens(prices: List[float]) -> List[str]:
+    return [movement_token(pct_change(a, b)) for a, b in zip(prices, prices[1:])]
+
+
+def cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
+    if not a or not b:
+        return 0.0
+    common = set(a) & set(b)
+    dot = sum(a[k] * b[k] for k in common)
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+    return 0.0 if norm_a == 0 or norm_b == 0 else dot / (norm_a * norm_b)
+
+
+@dataclass
+class NGramModel:
+    eos_token: str = "<eos>"
+    unk_token: str = "<unk>"
+    min_count: int = 1
+    influence_tau: float = 0.5
+    curve_k: float = 8.0
+    curve_midpoint: float = 0.5
+
+    unigram: Counter = field(default_factory=Counter)
+    bigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    trigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    lexical_vectors: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    influence_vectors: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    vocabulary: List[str] = field(default_factory=list)
+    finalized: bool = False
+
+    def ingest_tokens(self, tokens: List[str]) -> None:
+        if not tokens:
+            return
+        sequence = ["<bos>", "<bos>"] + tokens + [self.eos_token]
+        for token in sequence:
+            self.unigram[token] += 1
+        for left, right in zip(sequence, sequence[1:]):
+            self.bigram[left][right] += 1
+        for a, b, c in zip(sequence, sequence[1:], sequence[2:]):
+            self.trigram[f"{a}\t{b}"][c] += 1
+        self.finalized = False
+
+    def finalize(self) -> None:
+        self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
+        if self.unk_token not in self.vocabulary:
+            self.vocabulary.append(self.unk_token)
+        token_contexts = defaultdict(Counter)
+        for context, counts in self.bigram.items():
+            for token, count in counts.items():
+                token_contexts[token][context] += count
+        self.lexical_vectors = {t: {ctx: c / (sum(cnts.values()) or 1) for ctx, c in cnts.items()} 
+                                for t, cnts in token_contexts.items()}
+        self.influence_vectors = {}
+        for source in self.vocabulary:
+            src_vec = self.lexical_vectors.get(source, {})
+            self.influence_vectors[source] = {
+                target: sim for target in self.vocabulary if source != target
+                and (sim := cosine_similarity(src_vec, self.lexical_vectors.get(target, {}))) >= self.influence_tau
+            }
+        self.finalized = True
+
+    def sample_next(self, prev: str, prev_prev: Optional[str], temperature: float = 0.8, top_k: int = 5) -> str:
+        if not self.finalized:
+            self.finalize()
+        counts = self.trigram.get(f"{prev_prev}\t{prev}") if prev_prev else None
+        if not counts:
+            counts = self.bigram.get(prev)
+        if not counts:
+            counts = self.unigram
+        total = sum(counts.values())
+        if not total:
+            return self.eos_token
+        items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        tokens, weights = zip(*items)
+        return random.choices(tokens, weights=weights, k=1)[0]
+
+
+@dataclass
+class AssetRuntime:
+    spec: AssetSpec
+    price_history: List[float] = field(default_factory=list)
+    model_holder: dict = field(default_factory=dict)
+    current_price: Optional[float] = None
+    predicted_token: Optional[str] = None
+    status: str = "starting..."
+    cycle_count: int = 0
+
+
+@dataclass
+class AppState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    assets: Dict[str, AssetRuntime] = field(default_factory=dict)
+
+
+state = AppState()
+stop_event = threading.Event()
+wake_event = threading.Event()
+BTC_KEY = "btc"
+
+
+def run_cycle(rt: AssetRuntime) -> None:
+    rt.cycle_count += 1
+    current_price, error = fetch_coinapi_price(rt.spec.coinapi_symbol)
+    with state.lock:
+        if current_price is None:
+            rt.status = f"fetch failed: {error}"
+            return
+        rt.status = "ok"
+        rt.price_history.append(current_price)
+        tokens = prices_to_tokens(rt.price_history)
+
+        if rt.cycle_count % RETRAIN_EVERY_N_CYCLES == 0 or rt.model_holder.get("model") is None:
+            model = NGramModel()
+            model.ingest_tokens(tokens)
+            model.finalize()
+            rt.model_holder["model"] = model
+
+        model = rt.model_holder["model"]
+        prev = tokens[-1] if tokens else "<bos>"
+        prev_prev = tokens[-2] if len(tokens) >= 2 else None
+        next_token = model.sample_next(prev, prev_prev)
+        if next_token in ("<eos>", "<unk>"):
+            next_token = "flat"
+
+        rt.predicted_token = next_token
+        rt.current_price = current_price
+
+        # Fire live EMS order evaluation
+        live_portfolio.evaluate_signal(rt.spec, current_price, next_token)
+
+
+def background_loop() -> None:
+    with state.lock:
+        for spec in ASSETS:
+            state.assets[spec.key] = AssetRuntime(spec=spec, status="fetching history...")
+    for rt in state.assets.values():
+        rt.price_history = fetch_coinapi_history(rt.spec.coinapi_symbol)
+        rt.status = "starting..."
+
+    while not stop_event.is_set():
+        for rt in list(state.assets.values()):
+            if stop_event.is_set():
+                break
+            run_cycle(rt)
+        wake_event.wait(REFRESH_INTERVAL_SECONDS)
+        wake_event.clear()
+
+
+def make_icon_image(bucket: str) -> Image.Image:
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    color = COLORS.get(bucket, COLORS["unknown"])
+    if bucket == "up":
+        draw.polygon([(32, 12), (52, 46), (12, 46)], fill=color)
+    elif bucket == "down":
+        draw.polygon([(12, 18), (52, 18), (32, 52)], fill=color)
+    else:
+        draw.rounded_rectangle([14, 26, 50, 38], radius=6, fill=color)
+    return img
+
+
+def menu_mode_text(icon: pystray.Icon) -> str:
+    mode = "LIVE TRADING ON" if LIVE_TRADING_ENABLED else "LIVE TRADING DISABLED"
+    return f"Mode: {mode}"
+
+
+def menu_orders_text(icon: pystray.Icon) -> str:
+    active = len(live_portfolio.active_orders)
+    return f"Active EMS Positions: {active}"
+
+
+def _make_line(key: str):
+    def _getter(icon: pystray.Icon) -> str:
+        with state.lock:
+            rt = state.assets.get(key)
+            if not rt or not rt.current_price:
+                return f"{key}: loading..."
+            pos = live_portfolio.active_orders.get(key)
+            pos_tag = f" [{pos['side']} live]" if pos else ""
+            return f"{rt.spec.label}: ${rt.current_price:,.2f} | next: {(rt.predicted_token or '--').upper()}{pos_tag}"
+    return _getter
+
+
+def main() -> None:
+    icon = pystray.Icon(
+        "coinapi_live_trader",
+        make_icon_image("flat"),
+        "CoinAPI Live Trader",
+        menu=pystray.Menu(
+            pystray.MenuItem(menu_mode_text, None, enabled=False),
+            pystray.MenuItem(menu_orders_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            *([pystray.MenuItem(_make_line(spec.key), None, enabled=False) for spec in ASSETS]),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", lambda i, item: (stop_event.set(), wake_event.set(), i.stop()))
+        )
+    )
+    threading.Thread(target=background_loop, daemon=True).start()
+    icon.run()
+
+
+if __name__ == "__main__":
+    main()COINAPI_KEY = os.environ.get("COINAPI_KEY", "YOUR_COINAPI_KEY_HERE")
 
 MOVE_THRESHOLDS = [
     ("strong_down", -1.5),
