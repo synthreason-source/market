@@ -26,7 +26,6 @@ Run (dry-run):
 Run (live):
     export KRAKEN_API_KEY="your_public_key"
     export KRAKEN_API_SECRET="your_base64_private_key"
-    export ENABLE_LIVE_TRADING=YES_I_UNDERSTAND
 
     python kraken_knapsack_trader.py \
         --live \
@@ -52,7 +51,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -83,8 +82,8 @@ class KrakenSpotClient:
         api_secret: str | None = None,
         timeout: float = 20.0,
     ):
-        self.api_key = api_key or os.environ["KRAKEN_API_KEY"]
-        self.api_secret = api_secret or os.environ["KRAKEN_API_SECRET"]
+        self.api_key = ""
+        self.api_secret = ""
         self.timeout = timeout
         self.session = requests.Session()
         self._nonce_lock = threading.Lock()
@@ -339,23 +338,59 @@ class Candidate:
 # ============================================================
 # NUMERICAL HELPERS
 # ============================================================
+def decimal_places(value: Any, default: int = 8) -> int:
+    """
+    Convert Kraken's precision metadata to an integer.
+    """
 
-def safe_float(value, default: float = 0.0) -> float:
     try:
-        if value is None:
-            return default
-
-        value = float(value)
-
-        if not math.isfinite(value):
-            return default
-
-        return value
-
+        return max(0, int(value))
     except (TypeError, ValueError):
         return default
 
 
+def round_down_decimal(
+    value: float,
+    decimals: int,
+) -> str:
+    """
+    Round down without ever increasing the order volume.
+    """
+
+    if value <= 0:
+        return "0"
+
+    decimals = max(0, int(decimals))
+    quantum = Decimal("1").scaleb(-decimals)
+
+    rounded = Decimal(str(value)).quantize(
+        quantum,
+        rounding=ROUND_DOWN,
+    )
+
+    return format(rounded, "f")
+
+
+def normalise_pair_name(value: str) -> str:
+    """
+    Convert Kraken and CoinGecko symbols into a comparable form.
+    """
+
+    value = str(value).upper().strip()
+
+    replacements = {
+        "XBT": "BTC",
+        "XDG": "DOGE",
+    }
+
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+
+    return "".join(
+        character
+        for character in value
+        if character.isalnum()
+    )
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -417,7 +452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capital",
         type=float,
-        default=145.0,
+        default=50.0,
         help="Total capital available.",
     )
 
@@ -473,14 +508,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-positions",
         type=int,
-        default=25,
+        default=10,
         help="Maximum number of simultaneous positions.",
     )
 
     parser.add_argument(
         "--risk-budget",
         type=float,
-        default=50.0,
+        default=5.0,
         help="Maximum total modeled stop-loss risk.",
     )
 
@@ -591,7 +626,6 @@ def live_enabled(args) -> bool:
     return (
         args.live
         and args.confirm_live
-        and os.getenv("ENABLE_LIVE_TRADING") == "YES_I_UNDERSTAND"
     )
 
 
@@ -1340,12 +1374,319 @@ def print_statistics(coins: Sequence[Coin]) -> None:
 
     positive = sum(p > 0 for p in expected_profits)
     print(f"Positive-profit coins : {positive}/{len(coins)}")
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
 
+        value = float(value)
+
+        if not math.isfinite(value):
+            return default
+
+        return value
+
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def sigmoid(x: float) -> float:
+    x = clamp(x, -60.0, 60.0)
+
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def normalize_array(values: Sequence[float]) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64)
+
+    if len(x) == 0:
+        return x
+
+    finite = np.isfinite(x)
+
+    if not finite.any():
+        return np.full(len(x), 0.5, dtype=np.float64)
+
+    valid = x[finite]
+
+    lo = float(np.min(valid))
+    hi = float(np.max(valid))
+
+    if abs(hi - lo) < 1e-12:
+        return np.full(len(x), 0.5, dtype=np.float64)
+
+    out = (x - lo) / (hi - lo)
+
+    out[~np.isfinite(out)] = 0.5
+
+    return np.clip(out, 0.0, 1.0)
+
+
+def decimal_places(value: Any, default: int = 8) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def round_down_decimal(
+    value: float,
+    decimals: int,
+) -> str:
+    if value <= 0:
+        return "0"
+
+    decimals = max(0, int(decimals))
+    quantum = Decimal("1").scaleb(-decimals)
+
+    rounded = Decimal(str(value)).quantize(
+        quantum,
+        rounding=ROUND_DOWN,
+    )
+
+    return format(rounded, "f")
+
+
+def normalise_pair_name(value: str) -> str:
+    value = str(value).upper().strip()
+
+    replacements = {
+        "XBT": "BTC",
+        "XDG": "DOGE",
+    }
+
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+
+    return "".join(
+        character
+        for character in value
+        if character.isalnum()
+    )
+
+def load_kraken_pair_metadata(
+    client: KrakenSpotClient,
+) -> dict[str, dict[str, Any]]:
+    """
+    Retrieve Kraken's current pair metadata.
+
+    Returns a lookup indexed by normalised base symbol, for example:
+
+        BTC -> {
+            "pair": "XBTUSD",
+            "base": "XXBT",
+            "quote": "ZUSD",
+            "ordermin": 0.0001,
+            "pair_decimals": 1,
+            "lot_decimals": 8,
+        }
+    """
+
+    raw_pairs = client.asset_pairs()
+    metadata: dict[str, dict[str, Any]] = {}
+
+    for api_name, info in raw_pairs.items():
+        if not isinstance(info, dict):
+            continue
+
+        status = str(info.get("status", "online")).lower()
+
+        if status not in {"online", "post_only"}:
+            continue
+
+        base = str(
+            info.get("base", "")
+        ).upper()
+
+        quote = str(
+            info.get("quote", "")
+        ).upper()
+
+        wsname = str(
+            info.get("wsname", "")
+        ).upper()
+
+        altname = str(
+            info.get("altname", api_name)
+        ).upper()
+
+        # Prefer USD pairs because the optimizer uses USD prices.
+        pair_candidates = [
+            wsname,
+            altname,
+            api_name.upper(),
+        ]
+
+        pair_name = next(
+            (
+                candidate
+                for candidate in pair_candidates
+                if candidate.endswith("USD")
+                or candidate.endswith("/USD")
+            ),
+            "",
+        )
+
+        if not pair_name:
+            continue
+
+        if "/" in pair_name:
+            base_symbol = pair_name.split("/", 1)[0]
+        else:
+            base_symbol = pair_name
+
+            for suffix in ("USD", "ZUSD"):
+                if base_symbol.endswith(suffix):
+                    base_symbol = base_symbol[:-len(suffix)]
+                    break
+
+        base_symbol = normalise_pair_name(base_symbol)
+
+        if not base_symbol:
+            continue
+
+        metadata[base_symbol] = {
+            "api_name": api_name,
+            "pair": altname or api_name,
+            "wsname": wsname,
+            "base": base,
+            "quote": quote,
+            "ordermin": safe_float(
+                info.get("ordermin"),
+                0.0,
+            ),
+            "pair_decimals": decimal_places(
+                info.get("pair_decimals"),
+                8,
+            ),
+            "lot_decimals": decimal_places(
+                info.get("lot_decimals"),
+                8,
+            ),
+            "status": status,
+        }
+
+    return metadata
+
+
+def make_planned_order(
+    coin: Coin,
+    pair_metadata: dict[str, Any],
+) -> PlannedOrder | None:
+    """
+    Build an order that satisfies Kraken's volume minimum and
+    volume precision.
+
+    Orders are skipped instead of being submitted incorrectly.
+    """
+
+    pair = str(
+        pair_metadata.get("pair")
+        or pair_metadata.get("api_name")
+        or ""
+    ).upper()
+
+    if not pair:
+        LOG.warning(
+            "Skipping %s: Kraken pair name is unavailable.",
+            coin.symbol,
+        )
+        return None
+
+    minimum_volume = safe_float(
+        pair_metadata.get("ordermin"),
+        0.0,
+    )
+
+    volume_decimals = decimal_places(
+        pair_metadata.get("lot_decimals"),
+        8,
+    )
+
+    price_decimals = decimal_places(
+        pair_metadata.get("pair_decimals"),
+        8,
+    )
+
+    raw_volume = safe_float(
+        coin.quantity,
+        0.0,
+    )
+
+    volume = round_down_decimal(
+        raw_volume,
+        volume_decimals,
+    )
+
+    rounded_volume = safe_float(volume, 0.0)
+
+    if rounded_volume <= 0:
+        LOG.warning(
+            "Skipping %s: rounded volume is zero. "
+            "raw=%.12f precision=%d",
+            coin.symbol,
+            raw_volume,
+            volume_decimals,
+        )
+        return None
+
+    if minimum_volume > 0 and rounded_volume < minimum_volume:
+        LOG.warning(
+            "Skipping %s/%s: volume %.12f is below "
+            "Kraken minimum %.12f.",
+            coin.symbol,
+            pair,
+            rounded_volume,
+            minimum_volume,
+        )
+        return None
+
+    price = round_down_decimal(
+        coin.buy_limit,
+        price_decimals,
+    )
+
+    stop_price = round_down_decimal(
+        coin.stop_loss,
+        price_decimals,
+    )
+
+    tp_price = round_down_decimal(
+        coin.tp1,
+        price_decimals,
+    )
+
+    LOG.info(
+        "Prepared %s %s volume=%s price=%s min_volume=%s",
+        pair,
+        "BUY",
+        volume,
+        price,
+        minimum_volume,
+    )
+
+    return PlannedOrder(
+        pair=pair,
+        side="buy",
+        ordertype="limit",
+        volume=volume,
+        price=price,
+        stop_price=stop_price,
+        tp_price=tp_price,
+    )
 
 # ============================================================
 # CYCLE CONTROLLER
 # ============================================================
-
 def run_optimizer_cycle(
     args: argparse.Namespace,
     client: KrakenSpotClient,
@@ -1357,22 +1698,42 @@ def run_optimizer_cycle(
     # Reconcile account state
     # --------------------------------------------------------
 
-    try:
+    balances: dict[str, Any] = {}
+    open_orders: dict[str, Any] = {}
+
+    if trader.live:
         balances = client.balance()
         open_orders = client.open_orders()
-    except KrakenError:
-        LOG.exception("Kraken API error during reconciliation")
-        balances = {}
-        open_orders = {}
 
-    LOG.info(
-        "Account state: %d balances, %d open orders",
-        len(balances),
-        len(open_orders),
-    )
+        LOG.info(
+            "Account state: %d balances, %d open orders",
+            len(balances),
+            len(open_orders.get("open", {})),
+        )
+    else:
+        LOG.info(
+            "Dry-run mode: skipping private account reconciliation."
+        )
 
     # --------------------------------------------------------
-    # Fetch market data and build model
+    # Load Kraken pair metadata
+    # --------------------------------------------------------
+
+    pair_metadata: dict[str, dict[str, Any]] = {}
+
+    try:
+        pair_metadata = load_kraken_pair_metadata(client)
+        LOG.info(
+            "Loaded %d eligible Kraken USD pairs.",
+            len(pair_metadata),
+        )
+    except KrakenError:
+        LOG.exception(
+            "Unable to load Kraken pair metadata."
+        )
+
+    # --------------------------------------------------------
+    # Fetch market data
     # --------------------------------------------------------
 
     LOG.info("Fetching market data...")
@@ -1382,7 +1743,10 @@ def run_optimizer_cycle(
         timeout=args.timeout,
     )
 
-    LOG.info("Received %d market records.", len(market_data))
+    LOG.info(
+        "Received %d market records.",
+        len(market_data),
+    )
 
     coins = build_coins(
         market_data=market_data,
@@ -1397,15 +1761,106 @@ def run_optimizer_cycle(
     )
 
     if not coins:
-        raise RuntimeError("No usable coins were returned.")
+        raise RuntimeError(
+            "No usable coins were returned."
+        )
 
-    LOG.info("Using %d valid coins.", len(coins))
+    LOG.info(
+        "Using %d valid coins.",
+        len(coins),
+    )
 
     # --------------------------------------------------------
-    # Optimization
+    # Apply Kraken pair metadata before optimization
     # --------------------------------------------------------
 
-    LOG.info("Running probabilistic knapsack search...")
+    usable_coins: list[Coin] = []
+
+    for coin in coins:
+        symbol = normalise_pair_name(coin.symbol)
+        metadata = pair_metadata.get(symbol)
+
+        if metadata is None:
+            LOG.info(
+                "Skipping %s: no eligible Kraken USD pair.",
+                coin.symbol,
+            )
+            continue
+
+        coin.kraken_pair = str(
+            metadata.get("pair")
+            or metadata.get("api_name")
+            or ""
+        )
+
+        coin.base_asset = str(
+            metadata.get("base", "")
+        )
+
+        coin.quote_asset = str(
+            metadata.get("quote", "")
+        )
+
+        coin.order_minimum = safe_float(
+            metadata.get("ordermin"),
+            0.0,
+        )
+
+        coin.price_decimals = decimal_places(
+            metadata.get("pair_decimals"),
+            8,
+        )
+
+        coin.volume_decimals = decimal_places(
+            metadata.get("lot_decimals"),
+            8,
+        )
+
+        # Reject positions which cannot meet the exchange minimum
+        # after rounding down.
+        rounded_quantity = safe_float(
+            round_down_decimal(
+                coin.quantity,
+                coin.volume_decimals,
+            ),
+            0.0,
+        )
+
+        if (
+            coin.order_minimum > 0
+            and rounded_quantity < coin.order_minimum
+        ):
+            LOG.info(
+                "Skipping %s: quantity %.12f is below "
+                "minimum %.12f.",
+                coin.symbol,
+                rounded_quantity,
+                coin.order_minimum,
+            )
+            continue
+
+        usable_coins.append(coin)
+
+    coins = usable_coins
+
+    if not coins:
+        LOG.warning(
+            "No coins meet Kraken pair and volume requirements."
+        )
+        return
+
+    LOG.info(
+        "%d coins remain after Kraken validation.",
+        len(coins),
+    )
+
+    # --------------------------------------------------------
+    # Optimize
+    # --------------------------------------------------------
+
+    LOG.info(
+        "Running probabilistic knapsack search..."
+    )
 
     start = time.time()
 
@@ -1423,9 +1878,13 @@ def run_optimizer_cycle(
 
     if candidate is None:
         LOG.info(
-            "Probabilistic sampling did not find a feasible portfolio."
+            "Probabilistic sampling did not find "
+            "a feasible portfolio."
         )
-        LOG.info("Running deterministic fallback...")
+
+        LOG.info(
+            "Running deterministic fallback..."
+        )
 
         candidate = deterministic_fallback(
             coins=coins,
@@ -1435,63 +1894,88 @@ def run_optimizer_cycle(
             min_profit=args.min_profit,
         )
 
-    LOG.info("Optimization time: %.3f seconds", elapsed)
+    LOG.info(
+        "Optimization time: %.3f seconds",
+        elapsed,
+    )
 
     if candidate is None:
-        LOG.warning("No feasible portfolio found this cycle.")
+        LOG.warning(
+            "No feasible portfolio found this cycle."
+        )
         return
-
-    # --------------------------------------------------------
-    # Print / log results
-    # --------------------------------------------------------
 
     print_portfolio(candidate, coins)
 
     # --------------------------------------------------------
-    # Convert to orders (placeholder logic)
+    # Create validated orders
     # --------------------------------------------------------
 
-    orders: List[PlannedOrder] = []
+    orders: list[PlannedOrder] = []
 
     for index in candidate.indices:
         coin = coins[index]
 
-        # In a real implementation, map coin.symbol to a Kraken pair.
-        # Here we just use a placeholder.
-        pair = f"{coin.symbol}USD"
+        symbol = normalise_pair_name(coin.symbol)
+        metadata = pair_metadata.get(symbol)
 
-        order = PlannedOrder(
-            pair=pair,
-            side="buy",
-            ordertype="limit",
-            volume=str(round(coin.quantity, 8)),
-            price=str(round(coin.buy_limit, 8)),
-            stop_price=str(round(coin.stop_loss, 8)),
-            tp_price=str(round(coin.tp1, 8)),
+        if metadata is None:
+            LOG.warning(
+                "Skipping %s: pair metadata disappeared.",
+                coin.symbol,
+            )
+            continue
+
+        order = make_planned_order(
+            coin=coin,
+            pair_metadata=metadata,
         )
 
+        if order is None:
+            continue
+
         orders.append(order)
+
+    LOG.info(
+        "Prepared %d valid orders from %d selected positions.",
+        len(orders),
+        len(candidate.indices),
+    )
 
     # --------------------------------------------------------
     # Submit orders
     # --------------------------------------------------------
 
-    LOG.info("Submitting %d planned orders.", len(orders))
-
     for order in orders:
-        result = trader.submit(order)
-        LOG.info("Order result: %s", result)
+        try:
+            result = trader.submit(order)
+            LOG.info(
+                "Order result for %s: %s",
+                order.pair,
+                result,
+            )
+
+        except KrakenError as exc:
+            LOG.error(
+                "Order rejected for %s: %s",
+                order.pair,
+                exc,
+            )
 
     # --------------------------------------------------------
-    # Refresh dead-man's switch if live
+    # Renew dead-man's switch
     # --------------------------------------------------------
 
     if trader.live:
         try:
             client.cancel_all_after(60)
-            LOG.info("Dead-man's switch renewed for 60s.")
+            LOG.info(
+                "Dead-man's switch renewed for 60 seconds."
+            )
         except KrakenError:
-            LOG.exception("Failed to renew dead-man's switch.")
+            LOG.exception(
+                "Failed to renew dead-man's switch."
+            )
 
     # --------------------------------------------------------
     # Save CSV
@@ -1503,9 +1987,14 @@ def run_optimizer_cycle(
         selected_indices=candidate.indices,
     )
 
-    LOG.info("CSV saved to: %s", args.csv)
+    LOG.info(
+        "CSV saved to %s",
+        args.csv,
+    )
 
-    LOG.info("Cycle complete")
+    LOG.info(
+        "Cycle complete."
+    )
 
 
 def main() -> None:
@@ -1535,7 +2024,6 @@ def main() -> None:
     if args.live and not live:
         raise SystemExit(
             "Live trading requires --live, --confirm-live, "
-            "and ENABLE_LIVE_TRADING=YES_I_UNDERSTAND"
         )
 
     LOG.warning("Trading mode: %s", "LIVE" if live else "DRY RUN")
